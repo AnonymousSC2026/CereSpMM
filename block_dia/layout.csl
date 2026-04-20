@@ -1,0 +1,68 @@
+param h: u16;
+param w: u16;
+// Per-PE matrix tiling
+param Mt: u16;
+param Kt: u16;
+param Nt: u16;
+
+// Capacity for segmented DIA
+param MAX_NUM_DIAGS: u16;     // max number of diagonals per PE
+param MAX_VALS_PER_PX: u32;   // max total vals per PE
+
+const memcpy = @import_module("<memcpy/get_params>", .{
+  .width = w,
+  .height = h,
+});
+
+const c2d = @import_module("<collectives_2d/params>");
+
+layout {
+  @set_rectangle(w, h);
+
+  var px: u16 = 0;
+  while (px < w) : (px += 1) {
+    var py: u16 = 0;
+    while (py < h) : (py += 1) {
+      const memcpy_params = memcpy.get_params(px);
+      const c2d_params = c2d.get_params(px, py, .{
+        .x_colors      = .{ @get_color(0), @get_color(1) },
+        .x_entrypoints = .{ @get_local_task_id(8), @get_local_task_id(9) },
+        .y_colors      = .{ @get_color(4), @get_color(5) },
+        .y_entrypoints = .{ @get_local_task_id(10), @get_local_task_id(11) },
+      });
+
+      @set_tile_code(px, py, "pe.csl", .{
+        .memcpy_params = memcpy_params,
+        .c2d_params = c2d_params,
+        .Mt = Mt, .Kt = Kt, .Nt = Nt,
+        .MAX_NUM_DIAGS   = MAX_NUM_DIAGS,
+        .MAX_VALS_PER_PX = MAX_VALS_PER_PX,
+      });
+    }
+  }
+
+  // === Export symbols ===
+
+  // A metadata (sparse DIA format, segmented)
+  @export_name("A_diag_offset", [*]i32, true);          // [MAX_NUM_DIAGS]
+  @export_name("A_row_start",   [*]u32, true);          // [MAX_NUM_DIAGS]
+  @export_name("A_len",         [*]u32, true);          // [MAX_NUM_DIAGS]
+  @export_name("A_diag_ptr",    [*]u32, true);          // [MAX_NUM_DIAGS + 1]
+  @export_name("A_vals",        [*]f16, true);          // [MAX_VALS_PER_PX]
+  @export_name("num_diags",     [*]u32, true);          // scalar
+  @export_name("vals_len",      [*]u32, true);          // scalar
+
+  // B matrix (per PE receives [Kt x Nt])
+  @export_name("B", [*]f16, true);                      
+
+  // C matrix (each PE computes local [Mt x Nt] result)
+  @export_name("C_band", [*]f32, true);                
+
+  // TSC timing
+  @export_name("tsc_totals", [*]u32, true);
+  @export_name("f_enable_tsc", fn()void);
+  @export_name("f_get_timestamps", fn()void);
+
+  // Main compute entry
+  @export_name("main", fn()void);
+}

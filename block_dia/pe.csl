@@ -1,0 +1,329 @@
+// Segmented-DIA SpMM PE kernel for rectangular grid (h×w)
+// FP16 multiply (@fmulh) + FP32 accumulate
+
+// ---------------- Params ----------------
+param Mt: u16;
+param Kt: u16;
+param Nt: u16;
+param MAX_NUM_DIAGS: u16;
+param MAX_VALS_PER_PX: u32;
+
+param px: u16;
+param py: u16;
+
+const w: u16 = @get_rectangle().width;
+const h: u16 = @get_rectangle().height;
+
+param memcpy_params: comptime_struct;
+param c2d_params:    comptime_struct;
+
+// ---------------- Modules ----------------
+const sys_mod   = @import_module("<memcpy/memcpy>", memcpy_params);
+const timestamp = @import_module("<time>");
+const simprint  = @import_module("<simprint>");
+
+const mpi_x = @import_module("<collectives_2d/pe>", .{
+  .dim_params   = c2d_params.x,
+  .queues       = [2]u16{2, 4},
+  .dest_dsr_ids = [1]u16{1},
+  .src0_dsr_ids = [1]u16{1},
+  .src1_dsr_ids = [1]u16{1},
+});
+
+const mpi_y = @import_module("<collectives_2d/pe>", .{
+  .dim_params   = c2d_params.y,
+  .queues       = [2]u16{3, 5},
+  .dest_dsr_ids = [1]u16{2},
+  .src0_dsr_ids = [1]u16{2},
+  .src1_dsr_ids = [1]u16{2},
+});
+
+// ---------------- Task IDs ----------------
+const EXIT                  : local_task_id = @get_local_task_id(12);
+const TASK_COMPUTE_ONE_DEST : local_task_id = @get_local_task_id(13);
+const TASK_REDUCE_DONE      : local_task_id = @get_local_task_id(14);
+const TASK_RECV_B_DONE      : local_task_id = @get_local_task_id(15);
+
+// ---------------- Segmented-DIA buffers ----------------
+var A_diag_offset = @zeros([MAX_NUM_DIAGS]i32);
+var A_row_start   = @zeros([MAX_NUM_DIAGS]u32);
+var A_len         = @zeros([MAX_NUM_DIAGS]u32);
+var A_diag_ptr    = @zeros([MAX_NUM_DIAGS + 1]u32);
+var A_vals        = @zeros([MAX_VALS_PER_PX]f16);
+
+var num_diags_arr = @zeros([1]u32);
+var vals_len_arr  = @zeros([1]u32);
+
+var ptr_A_diag_offset: [*]i32 = &A_diag_offset;
+var ptr_A_row_start  : [*]u32 = &A_row_start;
+var ptr_A_len        : [*]u32 = &A_len;
+var ptr_A_diag_ptr   : [*]u32 = &A_diag_ptr;
+var ptr_A_vals       : [*]f16 = &A_vals;
+var ptr_num_diags    : [*]u32 = &num_diags_arr;
+var ptr_vals_len     : [*]u32 = &vals_len_arr;
+
+// ---------------- Dense tiles ----------------
+var B_tile = @zeros([@as(u32, Kt) * @as(u32, Nt)]f16);
+var C_tile = @zeros([@as(u32, Mt) * @as(u32, Nt)]f32);
+
+var ptr_B_tile : [*]f16 = &B_tile;
+var ptr_C_band : [*]f32 = &C_tile;
+
+// ---------------- Temp buffers ----------------
+var Cbuf    = @zeros([@as(u32, Mt) * @as(u32, Nt)]f32);
+var row_sum = @zeros([@as(u32, Mt) * @as(u32, Nt)]f32);
+
+// ---------------- Runtime state ----------------
+var px_id: u16 = 0;
+var py_id: u16 = 0;
+
+// ---------------- TSC ----------------
+var tsc_bcast_start = @zeros([timestamp.tsc_size_words]u16);
+var tsc_bcast_end   = @zeros([timestamp.tsc_size_words]u16);
+var tsc_comp_start  = @zeros([timestamp.tsc_size_words]u16);
+var tsc_comp_end    = @zeros([timestamp.tsc_size_words]u16);
+
+var tsc_diff_bcast: u64 = 0;
+var tsc_diff_comp : u64 = 0;
+var reduce_total: u64 = 0;
+
+var tsc_result = @zeros([6]u32);
+var ptr_tsc_result: [*]u32 = &tsc_result;
+
+// ---------------- Utils ----------------
+fn zero_buf_f32(buf: [*]f32, n: u32) void {
+  var i: u32 = 0;
+  while (i < n) {
+    buf[i] = 0.0;
+    i += 1;
+  }
+}
+
+fn tsc_u64(tsc: [*]u16) u64 {
+  return (@as(u64, tsc[0])
+        | (@as(u64, tsc[1]) << 16)
+        | (@as(u64, tsc[2]) << 32));
+}
+
+// ---------------- Compute ----------------
+fn build_Cbuf_for_cur_dest() void {
+
+  if (num_diags_arr[0] == 0) {
+    return;
+  }
+
+  const N32  : u32 = @as(u32, Nt);
+  const Mt32 : u32 = @as(u32, Mt);
+  const Kt32 : u32 = @as(u32, Kt);
+  const k0   : u32 = @as(u32, px_id) * Kt32;
+
+  const BN : u32 = 8;   // Dense blocking size
+
+  // --------------------------------------------------
+  // Zero output buffer (not counted as compute)
+  // --------------------------------------------------
+  zero_buf_f32(@ptrcast([*]f32, &Cbuf[0]), Mt32 * N32);
+
+  const nd: u32 = num_diags_arr[0];
+
+  timestamp.get_timestamp(&tsc_comp_start);
+
+  var dsdB_base = @get_dsd(mem1d_dsd, .{
+    .tensor_access = |i| {1} -> B_tile[i]
+  });
+
+  var q: u32 = 0;
+  while (q < nd) {
+
+    const d    : i32 = A_diag_offset[q];
+    const i0   : u32 = A_row_start[q];
+    const L    : u32 = A_len[q];
+    const base : u32 = A_diag_ptr[q];
+
+    var t: u32 = 0;
+    while (t < L) {
+
+      const i_global : u32 = i0 + t;
+
+      // --------------------------------------------------
+      // Check row ownership
+      // --------------------------------------------------
+      if (@as(u16, i_global / Mt32) != py_id) {
+        t += 1;
+        continue;
+      }
+
+      const rloc : u32 =
+        i_global - @as(u32, py_id) * Mt32;
+
+      // --------------------------------------------------
+      // Compute column index via diagonal offset
+      // --------------------------------------------------
+      const k_glob : i32 =
+        @as(i32, i0 + t) + d;
+
+      const kl : u32 =
+        @as(u32, k_glob - @as(i32, k0));
+
+      if (kl >= Kt32) {
+        t += 1;
+        continue;
+      }
+
+      const a16: f16 = A_vals[base + t];
+
+      const c_base: u32 = rloc * N32;
+      const b_base: u32 = kl   * N32;
+
+      // --------------------------------------------------
+      // BN-blocked dense loop
+      // --------------------------------------------------
+      var j_block: u32 = 0;
+      while (j_block < N32) {
+
+        const block_size =
+          if (j_block + BN <= N32)
+            BN
+          else
+            N32 - j_block;
+
+        const c_ptr_base = c_base + j_block;
+        const b_ptr_base = b_base + j_block;
+
+        var jj: u32 = 0;
+        while (jj < block_size) {
+
+          var tmp16: f16 = @as(f16, 0.0);
+
+          var dsdB = @increment_dsd_offset(
+            dsdB_base,
+            @as(i16, b_ptr_base + jj),
+            f16
+          );
+
+          @fmulh(
+            @ptrcast([*]f16, &tmp16),
+            a16,
+            dsdB
+          );
+
+          Cbuf[c_ptr_base + jj] +=
+            @as(f32, tmp16);
+
+          jj += 1;
+        }
+
+        j_block += BN;
+      }
+
+      t += 1;
+    }
+
+    q += 1;
+  }
+
+  timestamp.get_timestamp(&tsc_comp_end);
+}
+
+// ---------------- Tasks ----------------
+task compute_one_dest() void {
+  zero_buf_f32(@ptrcast([*]f32, &row_sum[0]),
+               @as(u32, Mt) * @as(u32, Nt));
+
+  build_Cbuf_for_cur_dest();
+
+  tsc_diff_comp +=
+  tsc_u64(&tsc_comp_end) - tsc_u64(&tsc_comp_start);
+
+  mpi_x.reduce_fadds(
+    w - 1,
+    @ptrcast([*]f32, &Cbuf[0]),
+    @ptrcast([*]f32, &row_sum[0]),
+    @as(u16, @as(u32, Mt) * @as(u32, Nt)),
+    TASK_REDUCE_DONE
+  );
+}
+
+task recv_b_done() void {
+  timestamp.get_timestamp(&tsc_bcast_end);
+  tsc_diff_bcast +=
+    tsc_u64(&tsc_bcast_end) - tsc_u64(&tsc_bcast_start);
+
+  @activate(TASK_COMPUTE_ONE_DEST);
+}
+
+task reduce_done() void {
+  if (px_id == w - 1) {
+    const total: u32 = @as(u32, Mt) * @as(u32, Nt);
+    var i: u32 = 0;
+    while (i < total) {
+      C_tile[i] = row_sum[i];
+      i += 1;
+    }
+  }
+
+  @activate(EXIT);
+}
+
+task exit() void {
+  sys_mod.unblock_cmd_stream();
+}
+
+// ---------------- Main ----------------
+fn main() void {
+  mpi_x.init();
+  mpi_y.init();
+
+  px_id = mpi_x.pe_id;
+  py_id = mpi_y.pe_id;
+
+  const b_len: u32 =
+    @as(u32, Kt) * @as(u32, Nt) / 2;
+
+  const b_ptr: [*]u32 =
+    @ptrcast([*]u32, &B_tile[0]);
+
+  timestamp.get_timestamp(&tsc_bcast_start);
+  mpi_y.broadcast(0, b_ptr, b_len, TASK_RECV_B_DONE);
+}
+
+fn f_enable_tsc() void {
+  timestamp.enable_tsc();
+  sys_mod.unblock_cmd_stream();
+}
+
+fn f_get_timestamps() void {
+  tsc_result[0] = @as(u32, tsc_diff_bcast & 0xFFFFFFFF);
+  tsc_result[1] = @as(u32, tsc_diff_bcast >> 32);
+  tsc_result[2] = @as(u32, tsc_diff_comp  & 0xFFFFFFFF);
+  tsc_result[3] = @as(u32, tsc_diff_comp  >> 32);
+  tsc_totals[4] = @as(u32, tsc_result & 0xffffffff);
+  tsc_totals[5] = @as(u32, tsc_result >> 32);
+  sys_mod.unblock_cmd_stream();
+}
+
+// ---------------- Exports ----------------
+comptime {
+  @bind_local_task(compute_one_dest, TASK_COMPUTE_ONE_DEST);
+  @bind_local_task(reduce_done,      TASK_REDUCE_DONE);
+  @bind_local_task(recv_b_done,      TASK_RECV_B_DONE);
+  @bind_local_task(exit,             EXIT);
+
+  @export_symbol(ptr_A_diag_offset, "A_diag_offset");
+  @export_symbol(ptr_A_row_start,   "A_row_start");
+  @export_symbol(ptr_A_len,         "A_len");
+  @export_symbol(ptr_A_diag_ptr,    "A_diag_ptr");
+  @export_symbol(ptr_A_vals,        "A_vals");
+  @export_symbol(ptr_num_diags,     "num_diags");
+  @export_symbol(ptr_vals_len,      "vals_len");
+
+  @export_symbol(ptr_B_tile, "B");
+  @export_symbol(ptr_C_band, "C_band");
+
+  @export_symbol(f_enable_tsc);
+  @export_symbol(f_get_timestamps);
+
+  @export_symbol(ptr_tsc_result, "tsc_totals");
+  @export_symbol(main);
+}
+

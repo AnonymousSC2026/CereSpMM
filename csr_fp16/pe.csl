@@ -1,0 +1,247 @@
+param c2d_params: comptime_struct;
+param memcpy_params: comptime_struct;
+
+// Matrix size params
+param Mt: u16;
+param Kt: u16;
+param Nt: u16;
+param MAX_META_LEN: u16;
+param MAX_PTR_LEN: u16;
+
+const EXIT            = @get_local_task_id(12);
+const compute_task_id = @get_local_task_id(13);
+const x_task_id       = @get_local_task_id(14);
+const y_task_id       = @get_local_task_id(15);
+const REDUCE_DONE     = @get_local_task_id(16);
+
+// MPI X
+const mpi_x = @import_module("<collectives_2d/pe>", .{
+    .dim_params   = c2d_params.x,
+    .queues       = [2]u16{2, 4},
+    .dest_dsr_ids = [1]u16{1},
+    .src0_dsr_ids = [1]u16{1},
+    .src1_dsr_ids = [1]u16{1},
+});
+
+// MPI Y
+const mpi_y = @import_module("<collectives_2d/pe>", .{
+    .dim_params   = c2d_params.y,
+    .queues       = [2]u16{3, 5},
+    .dest_dsr_ids = [1]u16{2},
+    .src0_dsr_ids = [1]u16{2},
+    .src1_dsr_ids = [1]u16{2},
+});
+
+const sys_mod   = @import_module("<memcpy/memcpy>", memcpy_params);
+const timestamp = @import_module("<time>");
+const simprint  = @import_module("<simprint>", .{ .enable = true });
+
+const w: u16 = @get_rectangle().width;
+const h: u16 = @get_rectangle().height;
+
+// ------------------------------------------------------
+// All arrays 32-bit aligned
+// ------------------------------------------------------
+
+var B_tile    : [Kt * Nt]f16 align(4) = @zeros([Kt * Nt]f16);
+var C_tile    : [Mt * Nt]f32 align(4) = @zeros([Mt * Nt]f32);
+var C_accum   : [Mt * Nt]f32 align(4) = @zeros([Mt * Nt]f32);
+
+var A_val     : [MAX_META_LEN]f16 align(4) = @zeros([MAX_META_LEN]f16);
+var A_col_idx : [MAX_META_LEN]u16 align(4) = @zeros([MAX_META_LEN]u16);
+var A_row_ptr : [MAX_PTR_LEN]u16  align(4) = @zeros([MAX_PTR_LEN]u16);
+
+var ptr_B:     [*]f16 = &B_tile;
+var ptr_Cacc:  [*]f32 = &C_accum;
+var ptr_val:   [*]f16 = &A_val;
+var ptr_col:   [*]u16 = &A_col_idx;
+var ptr_row:   [*]u16 = &A_row_ptr;
+
+var px: u16;
+var py: u16;
+var step: u16 = 0;
+
+// ------------------------------------------------------
+// TSC arrays
+// ------------------------------------------------------
+var tsc_bcast_start  = @zeros([timestamp.tsc_size_words]u16);
+var tsc_bcast_end    = @zeros([timestamp.tsc_size_words]u16);
+var tsc_comp_start   = @zeros([timestamp.tsc_size_words]u16);
+var tsc_comp_end     = @zeros([timestamp.tsc_size_words]u16);
+// [CHANGE 1] replace tsc_main_start/end with tsc_reduce_start/end
+var tsc_reduce_start = @zeros([timestamp.tsc_size_words]u16);
+var tsc_reduce_end   = @zeros([timestamp.tsc_size_words]u16);
+
+var bcast_total:  u64 = 0;
+var comp_total:   u64 = 0;
+// [CHANGE 2] add reduce_total accumulator
+var reduce_total: u64 = 0;
+
+var tsc_totals = @zeros([8]u32);
+var ptr_tsc_totals: [*]u32 = &tsc_totals;
+
+// ------------------------------------------------------
+// Helpers
+// ------------------------------------------------------
+task x_done() void { @activate(compute_task_id); }
+task y_done() void { @unblock(compute_task_id); }
+
+// [CHANGE 3] reduce_done captures end timestamp and accumulates
+task reduce_done() void {
+    timestamp.get_timestamp(&tsc_reduce_end);
+    reduce_total += tsc_u64(&tsc_reduce_end) - tsc_u64(&tsc_reduce_start);
+    @activate(EXIT);
+}
+
+fn tsc_u64(tsc: [*]u16) u64 {
+    const lo  = @as(u64, tsc[0]);
+    const mid = @as(u64, tsc[1]) << 16;
+    const hi  = @as(u64, tsc[2]) << 32;
+    return lo | mid | hi;
+}
+
+// ------------------------------------------------------
+// main()
+// ------------------------------------------------------
+fn main() void {
+    @assert(step < w);
+
+    if (step == 0) {
+        mpi_x.init();
+        mpi_y.init();
+        px = mpi_x.pe_id;
+        py = mpi_y.pe_id;
+        // [CHANGE 4] removed tsc_main_start capture (no longer needed)
+    }
+
+    // Zero C_tile
+    for (@range(u32, 0, Mt * Nt, 1)) |i| {
+        C_tile[i]  = 0.0;
+        C_accum[i] = 0.0;
+    }
+
+    timestamp.get_timestamp(&tsc_bcast_start);
+
+    @activate(compute_task_id);
+
+    const words: u16 = @as(u16, (Kt * Nt) / 2);
+
+    mpi_y.broadcast(
+        0,
+        @ptrcast([*]u32, &B_tile),
+        words,
+        y_task_id
+    );
+}
+
+// ------------------------------------------------------
+// compute()
+// ------------------------------------------------------
+task compute() void {
+    timestamp.get_timestamp(&tsc_bcast_end);
+    timestamp.get_timestamp(&tsc_comp_start);
+
+    const Bp16 = @ptrcast([*]f16, &B_tile);
+    const Ap16 = @ptrcast([*]f16, &A_val);
+    const Cp32 = @ptrcast([*]f32, &C_tile);
+
+    var dsdB_base = @get_dsd(mem1d_dsd, .{
+        .tensor_access = |i| {1} -> B_tile[i]
+    });
+
+    for (@range(u16, Mt)) |row| {
+        const row_start  = A_row_ptr[row];
+        const row_end    = A_row_ptr[row + 1];
+        const C_row_base: u32 = @as(u32, row) * @as(u32, Nt);
+
+        for (@range(u16, row_start, row_end, 1)) |idx| {
+            const a16  = Ap16[idx];
+            const bcol = A_col_idx[idx];
+            if (bcol >= Kt) continue;
+
+            const b_base: u32 = @as(u32, bcol) * @as(u32, Nt);
+
+            for (@range(u16, Nt)) |j| {
+                const bid: u32 = b_base + @as(u32, j);
+                const cid: u32 = C_row_base + @as(u32, j);
+
+                var tmp16: f16 = @as(f16, 0.0);
+                var dsdB = @increment_dsd_offset(dsdB_base, @as(i16, bid), f16);
+                @fmulh(@ptrcast([*]f16, &tmp16), a16, dsdB);
+
+                Cp32[cid] += @as(f32, tmp16);
+            }
+        }
+    }
+
+    timestamp.get_timestamp(&tsc_comp_end);
+
+    comp_total  += tsc_u64(&tsc_comp_end)  - tsc_u64(&tsc_comp_start);
+    bcast_total += tsc_u64(&tsc_bcast_end) - tsc_u64(&tsc_bcast_start);
+    // [CHANGE 5] removed tsc_main_end capture
+
+    step += 1;
+    @block(compute_task_id);
+
+    // [CHANGE 6] capture reduce start just before reduce_fadds
+    timestamp.get_timestamp(&tsc_reduce_start);
+
+    mpi_x.reduce_fadds(
+        w - 1,
+        @ptrcast([*]f32, &C_tile),
+        @ptrcast([*]f32, &C_accum),
+        Mt * Nt,
+        REDUCE_DONE
+    );
+}
+
+// ------------------------------------------------------
+// Exit & TSC
+// ------------------------------------------------------
+task f_exit() void {
+    sys_mod.unblock_cmd_stream();
+}
+
+fn f_enable_tsc() void {
+    timestamp.enable_tsc();
+    sys_mod.unblock_cmd_stream();
+}
+
+fn f_get_timestamps() void {
+    tsc_totals[0] = @as(u32, bcast_total  & 0xffffffff);
+    tsc_totals[1] = @as(u32, bcast_total  >> 32);
+    tsc_totals[2] = @as(u32, comp_total   & 0xffffffff);
+    tsc_totals[3] = @as(u32, comp_total   >> 32);
+    // [CHANGE 7] slots [4-7] now store reduce_total (same pattern as bcast/comp)
+    tsc_totals[4] = @as(u32, reduce_total & 0xffffffff);
+    tsc_totals[5] = @as(u32, reduce_total >> 32);
+    tsc_totals[6] = 0;
+    tsc_totals[7] = 0;
+
+    sys_mod.unblock_cmd_stream();
+}
+
+// ------------------------------------------------------
+// Export
+// ------------------------------------------------------
+comptime {
+    @bind_local_task(f_exit, EXIT);
+    @bind_local_task(compute, compute_task_id);
+    @bind_local_task(x_done, x_task_id);
+    @bind_local_task(y_done, y_task_id);
+    @bind_local_task(reduce_done, REDUCE_DONE);
+
+    @block(compute_task_id);
+
+    @export_symbol(ptr_B,    "B");
+    @export_symbol(ptr_Cacc, "C_band");
+    @export_symbol(ptr_val,  "A_val");
+    @export_symbol(ptr_col,  "A_col_idx");
+    @export_symbol(ptr_row,  "A_row_ptr");
+
+    @export_symbol(ptr_tsc_totals, "tsc_totals");
+    @export_symbol(f_enable_tsc);
+    @export_symbol(f_get_timestamps);
+
+    @export_symbol(main);
+}
