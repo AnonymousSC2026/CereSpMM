@@ -1,15 +1,14 @@
 """
 CereSpMM Feature Extractor
 ==========================
-从目录下所有 .mtx 文件提取稀疏矩阵特征，保存为 CSV。
 
-用法:
+Instruction:
     python extract_features.py --dir ./matrices --out features.csv
 
-    # 如果矩阵和脚本在同一目录:
+    # If in the same dir:
     python extract_features.py
 
-依赖:
+dependencies:
     pip install numpy scipy pandas
 """
 
@@ -22,9 +21,9 @@ from scipy.sparse import csr_matrix
 
 
 def extract_features(mtx_path: str) -> dict:
-    """从单个 .mtx 文件提取全部 12 个特征"""
 
-    # ── 读取并转换为 CSR ──────────────────────────────────────
+
+
     try:
         raw = mmread(mtx_path)
         A = csr_matrix(raw)
@@ -39,10 +38,10 @@ def extract_features(mtx_path: str) -> dict:
         print(f"  [SKIP] {mtx_path}: empty matrix")
         return None
 
-    # ── Group 1: 基本特征 ─────────────────────────────────────
+
     nnz_ratio = nnz / (n_rows * n_cols)
 
-    # ── Group 2: 每行 nnz 分布 ────────────────────────────────
+
     row_nnz = np.diff(A.indptr).astype(np.float64)   # shape (n_rows,)
 
     max_nnz = row_nnz.max()
@@ -51,19 +50,15 @@ def extract_features(mtx_path: str) -> dict:
     var_nnz = row_nnz.var()
     cv_nnz  = row_nnz.std() / avg_nnz if avg_nnz > 0 else 0.0
 
-    # ── Group 3: 对角线结构特征 ───────────────────────────────
-    # 找出矩阵中实际出现的对角线编号 (col - row)
+
     rows_idx, cols_idx = A.nonzero()
     diag_offsets = cols_idx.astype(np.int64) - rows_idx.astype(np.int64)
     unique_diags = np.unique(diag_offsets)
 
-    dia_num   = len(unique_diags)                        # 实际对角线数
-    all_diags = n_rows + n_cols - 1                      # 所有可能对角线数
+    dia_num   = len(unique_diags)                        
+    all_diags = n_rows + n_cols - 1                      
     dia_ratio = dia_num / all_diags
 
-    # DIA 格式的 padding 率:
-    #   DIA 用 dia_num 条长度为 max(n_rows,n_cols) 的数组存储
-    #   实际有效元素 = nnz，其余为 padding
     dia_storage = dia_num * max(n_rows, n_cols)
     dia_pad = 1.0 - (nnz / dia_storage) if dia_storage > 0 else 1.0
 
@@ -87,12 +82,12 @@ def extract_features(mtx_path: str) -> dict:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dir", default=".",
-                        help="包含 .mtx 文件的目录 (默认: 当前目录)")
+                        help="include .mtx file path ")
     parser.add_argument("--out", default="features.csv",
-                        help="输出 CSV 文件名 (默认: features.csv)")
+                        help="output CSV filename (default: features.csv)")
     args = parser.parse_args()
 
-    # 找到所有 .mtx 文件
+
     mtx_files = sorted([
         os.path.join(args.dir, f)
         for f in os.listdir(args.dir)
@@ -100,10 +95,10 @@ def main():
     ])
 
     if not mtx_files:
-        print(f"[错误] 在 '{args.dir}' 下没有找到 .mtx 文件")
+        print(f"[ERROR] on '{args.dir}' .mtx file not found")
         return
 
-    print(f"找到 {len(mtx_files)} 个 .mtx 文件，开始提取特征...\n")
+    print(f"find {len(mtx_files)}  .mtx file, extracting features...\n")
 
     records = []
     for i, path in enumerate(mtx_files, 1):
@@ -113,25 +108,25 @@ def main():
             records.append(feat)
 
     if not records:
-        print("\n[错误] 没有成功提取任何特征")
+        print("\n[ERROR] No features extracted successfully")
         return
 
     df = pd.DataFrame(records)
 
-    # 添加一列空的 label 列，供你手动填写最优算法
-    df["label"] = ""   # 填写: CSR / BCOO / BDIA
+
+    df["label"] = ""   # fill: CSR / BCOO / BDIA
 
     out_path = os.path.join(args.dir, args.out)
     df.to_csv(out_path, index=False)
 
-    print(f"\n✓ 特征已保存到: {out_path}")
-    print(f"  共 {len(df)} 条记录，{len(df.columns)} 列\n")
+    print(f"\n✓ Features saved to: {out_path}")
+    print(f"  Totoal of  {len(df)} records, {len(df.columns)} columns\n")
     print(df.to_string(index=False))
     print()
     print("─" * 55)
-    print("下一步: 在 CSV 的 label 列填写每个矩阵在 CS-3 上")
-    print("        实测最快的算法 (CSR / BCOO / BDIA)，")
-    print("        然后传给 cerespMM_selector.py 训练模型。")
+    print("Next step: Fill in the 'label' column of the CSV file for each matrix on the CS-3.")
+    print("        Empirically Fastest Algorithms (CSR / BCOO / BDIA)")
+    print("        pass it to `cerespMM_selector.py` to train the model.")
 
 
 if __name__ == "__main__":
